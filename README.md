@@ -262,3 +262,14 @@ Nếu muốn chuyển dữ liệu cũ từ `library.db`, chạy `python CHUYEN_S
 ```powershell
 python -m streamlit run app.py
 ```
+
+## V32 - RAG thứ hai: Vector RAG + Hybrid RAG
+
+- Giữ nguyên BM25 RAG cũ.
+- Thêm `vector_rag_service.py` dùng Gemini Embedding để tìm kiếm ngữ nghĩa.
+- Có 3 chế độ trong Admin -> Cài đặt: `BM25`, `Vector`, `Hybrid`.
+- `Hybrid` kết hợp 45% BM25 + 55% semantic vector score.
+- Nếu Vector RAG/API lỗi, hệ thống tự fallback về BM25.
+- Cache embedding theo nội dung để giảm số lần gọi API.
+- Có `CHAY_WEB_MANG_LAN.bat` để chạy web trên IP LAN cho điện thoại/laptop khác cùng mạng truy cập.
+- Xem chi tiết tại `README_RAG2_VECTOR.md`.

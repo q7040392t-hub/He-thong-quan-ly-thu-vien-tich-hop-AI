@@ -2075,7 +2075,7 @@ def public_ai():
 @st.dialog("Trợ lý ảo LIBRA", width="small")
 def public_chat_dialog():
     ai=get_ai_service()
-    ai_state='🟢 Gemini AI' if ai.enabled else '🟡 Local RAG'
+    ai_state=(f'🟢 Gemini AI • {ai.rag_mode.upper()} RAG' if ai.enabled else '🟡 Local BM25 RAG')
     
     if len(st.session_state.public_chat_messages)<=1:
         st.markdown(
@@ -3206,8 +3206,11 @@ def ai_recommend_page(user):
             with st.expander('🧠 Chi tiết truy xuất RAG (Báo cáo kỹ thuật)'):
                 route_badge={'BOOK':'📘 THƯ VIỆN SÁCH','POLICY':'📜 CHÍNH SÁCH','GENERAL':'🌐 KHIẾN THỨC TỔNG QUÁT'}.get(info['route'], info['route'])
                 st.write(f"**Nhánh xử lý:** `{route_badge}`")
+                st.write(f"**RAG đang dùng:** `{info.get('rag_mode','BM25')}`")
                 st.write(f"**Sách truy xuất từ MySQL:** {', '.join(info['retrieved_books']) or 'Không có'}")
-                st.caption(f"BM25 Book Score: {info['book_score']} • Policy Score: {info['policy_score']} • Chunks: {info['policy_chunks']}")
+                if info.get('vector_scores'):
+                    st.caption('Vector similarity: ' + ', '.join(str(x) for x in info['vector_scores']))
+                st.caption(f"Retrieval Score: {info['book_score']} • Policy Score: {info['policy_score']} • Chunks: {info['policy_chunks']} • Vector: {'ON' if info.get('vector_enabled') else 'OFF'}")
     with right:
         st.markdown('<div class="panel"><div class="mini-title">✨ Sách gợi ý nhanh</div>',unsafe_allow_html=True)
         topic=st.selectbox('Chủ đề',['Công nghệ thông tin','Trinh thám','Tình cảm','Kỹ năng sống','Tâm lý học','Kinh tế & Kinh doanh'])
@@ -3220,8 +3223,9 @@ def ai_recommend_page(user):
         with st.expander('🧩 Kỹ thuật hệ thống'):
             tech=f"""- **Frontend:** Streamlit + CSS tùy biến.
 - **Database:** **{info['engine'].upper()}** — `{info['database']}` tại `{info['host']}:{info['port']}`.
-- **Tìm kiếm:** BM25 có mở rộng từ khóa theo ngữ nghĩa/thể loại.
-- **RAG tự chọn:** BOOK / POLICY / GENERAL.
+- **Tìm kiếm:** BM25 + Semantic Vector Retrieval.
+- **Hai RAG:** BM25 RAG (từ khóa) và Vector RAG (embedding); chế độ Hybrid kết hợp cả hai.
+- **Router:** BOOK / POLICY / GENERAL.
 - **Tối ưu tốc độ:** BOOK và POLICY trả lời cục bộ; không gọi Gemini nếu không cần.
 - **Generation:** Gemini chỉ xử lý kiến thức tổng quát hoặc yêu cầu phân tích/tóm tắt.
 - **Trạng thái DB:** {'✅ Đã kết nối' if ok_db else '❌ Chưa kết nối'}.
@@ -3462,17 +3466,23 @@ def settings_page(user):
         st.markdown('**Cấu hình RAG / tìm kiếm**')
         r1,r2=st.columns(2)
         with r1: ragk=st.number_input('Top-K ngữ cảnh RAG',1,20,int(db.get_setting('rag_top_k',5)))
-        with r2: ragmode=st.selectbox('Chế độ RAG',['auto'],index=0,help='Auto tự chọn dữ liệu sách, chính sách hoặc kiến thức tổng quát.')
+        rag_options=['hybrid','bm25','vector']
+        current_rag=str(db.get_setting('rag_mode','hybrid') or 'hybrid').lower()
+        if current_rag=='auto': current_rag='hybrid'
+        current_idx=rag_options.index(current_rag) if current_rag in rag_options else 0
+        with r2: ragmode=st.selectbox('Chế độ RAG',rag_options,index=current_idx,format_func=lambda x:{'hybrid':'Hybrid - BM25 + Vector','bm25':'BM25 RAG - Từ khóa','vector':'Vector RAG - Ngữ nghĩa'}[x],help='Hybrid kết hợp BM25 và embedding. Vector cần Gemini API; nếu lỗi hệ thống tự fallback BM25.')
         save=st.form_submit_button('Lưu cài đặt',type='primary')
     if save:
         for k,v in [('library_name',name),('loan_days',days),('max_books_per_reader',maxb),('max_renewals',renew),('fine_per_day',fine),('auto_lock_overdue_days',lockdays),('lost_after_days',lostdays),('lost_book_fee',lostfee),('reservation_hold_days',hold),('rag_top_k',ragk),('rag_mode',ragmode),('library_email',email),('library_phone',phone)]: db.set_setting(k,v)
-        db.log_activity(user['id'],'Cập nhật cài đặt','Thay đổi quy định thư viện'); st.success('Đã lưu cài đặt.')
+        db.log_activity(user['id'],'Cập nhật cài đặt','Thay đổi quy định thư viện'); st.session_state.pop('_ai_service',None); st.success('Đã lưu cài đặt. RAG sẽ dùng cấu hình mới ngay ở lần hỏi tiếp theo.')
     with st.expander('📐 Luồng xử lý mới của hệ thống'):
         st.markdown('''
 **Giới hạn mượn:** kiểm tra hạn mức ngay khi độc giả gửi yêu cầu và kiểm tra lại khi thủ thư duyệt.  
 **Không trả sách:** quá hạn → tính phạt → chặn mượn mới → đủ số ngày cấu hình thì tự khóa quyền mượn → quản trị có thể đánh dấu chưa trả/mất và cộng phí thay thế.  
-**BM25:** dùng để xếp hạng kết quả tìm kiếm theo từ khóa thay vì chỉ `LIKE`.  
-**RAG tự chọn:** câu hỏi về sách → truy xuất sách; câu hỏi quy định → truy xuất chính sách; câu hỏi tổng quát → Gemini trực tiếp.
+**BM25 RAG:** xếp hạng theo từ khóa, chạy cục bộ và nhanh.  
+**Vector RAG:** dùng Gemini Embedding để tìm nội dung gần nghĩa với câu hỏi.  
+**Hybrid RAG:** kết hợp BM25 + Vector để tăng độ chính xác; nếu Vector không khả dụng sẽ tự fallback BM25.  
+**Router:** câu hỏi về sách → truy xuất sách; câu hỏi quy định → truy xuất chính sách; câu hỏi tổng quát → Gemini trực tiếp.
 ''')
 
 # ------------------------------------------------------------------

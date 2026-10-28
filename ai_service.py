@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 import database as db
 from bm25_service import load_policy_chunks, rank_text_chunks, rank_books
+from vector_rag_service import VectorRAGService
 
 load_dotenv()
 
@@ -54,9 +55,9 @@ def _book_context(books):
 def _local_book_answer(books):
     if not books:
         return 'Mình chưa tìm thấy sách phù hợp trong kho. Bạn thử tên tác giả, thể loại hoặc từ khóa cụ thể hơn nhé.'
-    top=float(books[0].get('_bm25_score',0) or 0)
+    top=float(books[0].get('_rag_score', books[0].get('_bm25_score', books[0].get('_vector_score',0))) or 0)
     cutoff=top*0.45 if top>0 else 0
-    shown=[b for b in books if float(b.get('_bm25_score',top) or 0)>=cutoff][:5]
+    shown=[b for b in books if float(b.get('_rag_score', b.get('_bm25_score', b.get('_vector_score',top))) or 0)>=cutoff][:5]
     if not shown: shown=books[:5]
     lines=['Dựa trên **kho sách hiện tại**, mình gợi ý:']
     for i,b in enumerate(shown,1):
@@ -103,6 +104,18 @@ class AIService:
         self.enabled=bool(genai and api_key and api_key!='PASTE_YOUR_GEMINI_API_KEY_HERE')
         self.client=genai.Client(api_key=api_key) if self.enabled else None
         self.policy_chunks=load_policy_chunks(POLICY_FILE)
+
+        # RAG #1 = BM25 (local), RAG #2 = semantic/vector embeddings (Gemini).
+        # HYBRID combines both. Legacy value `auto` is treated as hybrid.
+        try:
+            raw_rag_mode=str(db.get_setting('rag_mode', os.getenv('RAG_MODE','hybrid')) or 'hybrid').strip().lower()
+        except Exception:
+            raw_rag_mode=str(os.getenv('RAG_MODE','hybrid') or 'hybrid').strip().lower()
+        if raw_rag_mode == 'auto':
+            raw_rag_mode = 'hybrid'
+        self.rag_mode = raw_rag_mode if raw_rag_mode in ('bm25','vector','hybrid') else 'hybrid'
+        self.vector_rag = VectorRAGService(self.client) if self.enabled else None
+        self.vector_enabled = bool(self.vector_rag and self.vector_rag.enabled)
 
         # Keep retrieval intentionally small; shorter context = faster generation.
         try:
@@ -152,25 +165,100 @@ class AIService:
         self._books_cache_at=0.0
         self._answer_cache.clear()
 
-    def _book_search(self, query):
-        ranked=rank_books(self._catalog(),query,top_k=self.top_k)
+    def _book_search_bm25(self, query, top_k=None):
+        limit=int(top_k or self.top_k)
+        ranked=rank_books(self._catalog(),query,top_k=limit)
         if not ranked:
             return []
         top=float(ranked[0].get('_bm25_score',0) or 0)
         threshold=max(0.8,top*0.30) if top>0 else 0.8
         filtered=[b for b in ranked if float(b.get('_bm25_score',0) or 0)>=threshold]
-        return (filtered or ranked)[:self.top_k]
+        return (filtered or ranked)[:limit]
+
+    def _book_search_vector(self, query, top_k=None):
+        if not self.vector_enabled:
+            return []
+        try:
+            return self.vector_rag.rank_books(self._catalog(), query, top_k=int(top_k or self.top_k))
+        except Exception:
+            return []
+
+    def _book_search(self, query):
+        if self.rag_mode == 'bm25':
+            return self._book_search_bm25(query)
+
+        if self.rag_mode == 'vector':
+            semantic=self._book_search_vector(query)
+            if semantic:
+                for b in semantic:
+                    b['_rag_score']=b.get('_vector_score',0)
+                return semantic[:self.top_k]
+            return self._book_search_bm25(query)
+
+        # HYBRID: lexical precision (BM25) + semantic similarity (Vector RAG).
+        bm=self._book_search_bm25(query, top_k=max(self.top_k*3, 8))
+        vec=self._book_search_vector(query, top_k=max(self.top_k*3, 8))
+        if not vec:
+            return bm[:self.top_k]
+        by_id={}
+        max_b=max([float(x.get('_bm25_score',0) or 0) for x in bm] or [1.0]) or 1.0
+        for item in bm:
+            row=dict(item)
+            row['_bm25_norm']=float(row.get('_bm25_score',0) or 0)/max_b
+            row['_vector_score']=0.0
+            by_id[str(row.get('id'))]=row
+        for item in vec:
+            key=str(item.get('id'))
+            row=by_id.get(key, dict(item))
+            row['_vector_score']=float(item.get('_vector_score',0) or 0)
+            row.setdefault('_bm25_norm',0.0)
+            row.setdefault('_bm25_score',0.0)
+            by_id[key]=row
+        for row in by_id.values():
+            row['_rag_score']=round(0.45*float(row.get('_bm25_norm',0) or 0)+0.55*max(0.0,float(row.get('_vector_score',0) or 0)),6)
+        ranked=sorted(by_id.values(),key=lambda x:x.get('_rag_score',0),reverse=True)
+        return ranked[:self.top_k]
+
+    def _policy_search(self, query):
+        if self.rag_mode == 'bm25' or not self.vector_enabled:
+            return rank_text_chunks(self.policy_chunks,query,top_k=min(self.top_k,3))
+        if self.rag_mode == 'vector':
+            try:
+                result=self.vector_rag.rank_policy_chunks(self.policy_chunks,query,top_k=min(self.top_k,3))
+                if result:
+                    return result
+            except Exception:
+                pass
+            return rank_text_chunks(self.policy_chunks,query,top_k=min(self.top_k,3))
+
+        bm=rank_text_chunks(self.policy_chunks,query,top_k=max(min(self.top_k*3,9),3))
+        try:
+            vec=self.vector_rag.rank_policy_chunks(self.policy_chunks,query,top_k=max(min(self.top_k*3,9),3))
+        except Exception:
+            vec=[]
+        if not vec:
+            return bm[:min(self.top_k,3)]
+        by_index={}
+        max_b=max([float(x.get('score',0) or 0) for x in bm] or [1.0]) or 1.0
+        for x in bm:
+            row=dict(x); row['bm25_score']=float(row.get('score',0) or 0); row['bm25_norm']=row['bm25_score']/max_b; row['vector_score']=0.0
+            by_index[int(row.get('index',-1))]=row
+        for x in vec:
+            idx=int(x.get('index',-1)); row=by_index.get(idx,dict(x)); row['vector_score']=float(x.get('vector_score',x.get('score',0)) or 0); row.setdefault('bm25_norm',0.0); row.setdefault('bm25_score',0.0); by_index[idx]=row
+        for row in by_index.values():
+            row['score']=round(0.45*float(row.get('bm25_norm',0) or 0)+0.55*max(0.0,float(row.get('vector_score',0) or 0)),6)
+        return sorted(by_index.values(),key=lambda x:x.get('score',0),reverse=True)[:min(self.top_k,3)]
 
     def retrieve(self, query):
         # Fast-path routing: do not calculate both retrieval branches for every message.
         if _policy_like(query):
-            policies=rank_text_chunks(self.policy_chunks,query,top_k=min(self.top_k,3))
+            policies=self._policy_search(query)
             score=policies[0].get('score',0) if policies else 0
             return {'route':'POLICY','books':[],'policies':policies,'book_score':0,'policy_score':score}
 
         if _book_like(query):
             books=self._book_search(query)
-            score=books[0].get('_bm25_score',0) if books else 0
+            score=books[0].get('_rag_score',books[0].get('_bm25_score',books[0].get('_vector_score',0))) if books else 0
             return {'route':'BOOK','books':books,'policies':[],'book_score':score,'policy_score':0}
 
         # Most normal/general questions go straight to Gemini: zero MySQL queries.
@@ -181,12 +269,12 @@ class AIService:
 
         # Ambiguous library question: only then compare both small retrieval branches.
         books=self._book_search(query)
-        policies=rank_text_chunks(self.policy_chunks,query,top_k=min(self.top_k,3))
-        book_score=books[0].get('_bm25_score',0) if books else 0
+        policies=self._policy_search(query)
+        book_score=books[0].get('_rag_score',books[0].get('_bm25_score',books[0].get('_vector_score',0))) if books else 0
         policy_score=policies[0].get('score',0) if policies else 0
         if policy_score > book_score*1.15 and policy_score>0.5:
             route='POLICY'
-        elif book_score>=1.0:
+        elif book_score >= (1.0 if self.rag_mode=='bm25' else 0.35):
             route='BOOK'
         else:
             route='GENERAL'
@@ -197,6 +285,8 @@ class AIService:
         return {
             'route':r['route'],'book_score':round(r['book_score'],3),'policy_score':round(r['policy_score'],3),
             'retrieved_books':[b['id'] for b in r['books']],'policy_chunks':len(r['policies']),
+            'rag_mode':self.rag_mode.upper(),'vector_enabled':self.vector_enabled,
+            'vector_scores':[round(float(b.get('_vector_score',0) or 0),3) for b in r['books']],
         }
 
     def answer(self, query, history=None, rag=None):
@@ -256,10 +346,11 @@ class AIService:
             f"Câu hỏi: {query}"
         )
         candidate_models=[self.model]
-        for fallback_m in ['gemini-2.5-flash','gemini-2.0-flash','gemini-1.5-flash','gemini-2.5-flash-lite']:
+        for fallback_m in ['gemini-3.5-flash-lite','gemini-flash-lite-latest','gemini-3.8-flash','gemini-flash-latest']:
             if fallback_m not in candidate_models:
                 candidate_models.append(fallback_m)
 
+        last_error=None
         for target_model in candidate_models:
             try:
                 response=self.client.models.generate_content(model=target_model,contents=prompt)
@@ -267,13 +358,24 @@ class AIService:
                 if text:
                     self._cache_put(query,text)
                     return text
-            except Exception:
+            except Exception as exc:
+                last_error=exc
                 continue
 
         if route=='BOOK': return _local_book_answer(rag['books'])
         if route=='POLICY': return _local_policy_answer(rag['policies'])
-        return ('Hệ thống AI hiện đang bận (server capacity limit). '
-                'Bạn vui lòng thử lại sau giây lát hoặc sử dụng ô tìm kiếm để tra cứu trực tiếp.')
+        err=str(last_error or '').lower()
+        if '429' in err or 'resource_exhausted' in err or 'quota' in err:
+            return ('Gemini API đang bị giới hạn lượt gọi (429/quota). '
+                    'Bạn thử lại sau một lúc hoặc kiểm tra quota/API key trong Google AI Studio.')
+        if '403' in err or 'permission_denied' in err or 'api key' in err:
+            return ('Gemini API chưa được cấp quyền hoặc API key không hợp lệ (403). '
+                    'Hãy kiểm tra GEMINI_API_KEY trong Streamlit Secrets.')
+        if '404' in err or 'not_found' in err:
+            return ('Model Gemini đang cấu hình không còn khả dụng (404). '
+                    'Hãy đặt GEMINI_MODEL=gemini-3.5-flash-lite trong Streamlit Secrets.')
+        return ('Gemini API đang tạm quá tải hoặc không phản hồi (503/5xx). '
+                'Hệ thống đã thử các model dự phòng nhưng chưa thành công. Bạn thử lại sau giây lát.')
 
     def answer_stream(self, query, history=None, rag=None):
         """Streaming generator for smooth, word-by-word UI rendering in Streamlit."""
@@ -338,12 +440,13 @@ class AIService:
         )
 
         candidate_models=[self.model]
-        for fallback_m in ['gemini-2.5-flash','gemini-2.0-flash','gemini-1.5-flash','gemini-2.5-flash-lite']:
+        for fallback_m in ['gemini-3.5-flash-lite','gemini-flash-lite-latest','gemini-3.8-flash','gemini-flash-latest']:
             if fallback_m not in candidate_models:
                 candidate_models.append(fallback_m)
 
         full_text=""
         success=False
+        last_error=None
 
         for target_model in candidate_models:
             try:
@@ -358,7 +461,8 @@ class AIService:
                 if chunk_found and full_text.strip():
                     success=True
                     break
-            except Exception:
+            except Exception as exc:
+                last_error=exc
                 full_text=""
                 continue
 
@@ -368,8 +472,19 @@ class AIService:
             if route=='BOOK': fb=_local_book_answer(rag['books'])
             elif route=='POLICY': fb=_local_policy_answer(rag['policies'])
             else:
-                fb=('Hệ thống AI đang bận (server capacity). Dưới đây là tra cứu từ thư viện:\n\n' +
-                    (_local_book_answer(rag['books']) if rag.get('books') else _local_policy_answer(rag['policies']) if rag.get('policies') else 'Bạn có thể thử lại sau giây lát hoặc sử dụng ô tra cứu sách.'))
+                err=str(last_error or '').lower()
+                if '429' in err or 'resource_exhausted' in err or 'quota' in err:
+                    fb=('Gemini API đang bị giới hạn lượt gọi (429/quota). '
+                        'Bạn thử lại sau một lúc hoặc kiểm tra quota/API key trong Google AI Studio.')
+                elif '403' in err or 'permission_denied' in err or 'api key' in err:
+                    fb=('Gemini API chưa được cấp quyền hoặc API key không hợp lệ (403). '
+                        'Hãy kiểm tra GEMINI_API_KEY trong Streamlit Secrets.')
+                elif '404' in err or 'not_found' in err:
+                    fb=('Model Gemini đang cấu hình không còn khả dụng (404). '
+                        'Hãy đặt GEMINI_MODEL=gemini-3.5-flash-lite trong Streamlit Secrets.')
+                else:
+                    fb=('Gemini API đang tạm quá tải hoặc không phản hồi (503/5xx). '
+                        'Hệ thống đã thử các model dự phòng nhưng chưa thành công. Bạn thử lại sau giây lát.')
             yield fb
 
 

@@ -4,3 +4,6 @@ venv/
 __pycache__/
 *.pyc
 library.db
+
+# Local semantic RAG embedding cache
+.vector_rag_cache.json
